@@ -13,3 +13,4 @@ python-jose[cryptography]
 bcrypt
 python-multipart
 langgraph-checkpoint-mongodb
+python-dotenv
