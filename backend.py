@@ -11,7 +11,7 @@ import io
 import copy
 from datetime import datetime, timedelta, timezone
 from fastapi.concurrency import run_in_threadpool
-
+import json
 #Authentication required imports
 import bcrypt
 from jose import JWTError, jwt
@@ -19,6 +19,7 @@ from typing import Optional
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 # from test import script_db
 from app import script_db
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
 
 # Azure Storage Imports for SAS generation
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
@@ -34,6 +35,13 @@ app = FastAPI(title="Script Duniya Pipeline API")
 
 os.makedirs("static", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+
+SERVICE_BUS_CONN_STR = os.getenv("SERVICE_BUS_CONN_STR")
+QUEUE_NAME = "pipeline-jobs"
+
+
 
 # --- SAS TOKEN CONFIGURATION ---
 BLOB_CONN_STR = os.getenv("BLOB_CONN_STR")
@@ -281,29 +289,69 @@ def run_pipeline_background(initial_state: dict, config: dict):
 
 
 
+
+
+
+
+
 @app.post("/api/start")
 async def start_pipeline(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
-    # Extract text from uploaded PDF or DOCX
     screenplay_text = await extract_text_from_file(file)
-    
     thread_id = str(uuid.uuid4())
-    config = {"configurable": {"thread_id": thread_id}}
     
+    # 1. Log the job in Cosmos DB
     projects_collection.insert_one({
         "thread_id": thread_id,
         "username": current_user["username"],
-        "status": "started",
+        "status": "queued", # Changed status to queued
         "original_screenplay": screenplay_text
     })
     
-    initial_state = {"screenplay_text": screenplay_text, "current_step": "init"}
-    background_tasks.add_task(run_pipeline_background, initial_state, config)
+    # 2. Push the job to Azure Service Bus
+    try:
+        with ServiceBusClient.from_connection_string(SERVICE_BUS_CONN_STR) as client:
+            with client.get_queue_sender(queue_name=QUEUE_NAME) as sender:
+                message_payload = {
+                    "thread_id": thread_id,
+                    "screenplay_text": screenplay_text
+                }
+                message = ServiceBusMessage(json.dumps(message_payload))
+                sender.send_messages(message)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to queue job: {str(e)}")
     
-    return {"thread_id": thread_id, "message": "Pipeline started in background"}
+    return {"thread_id": thread_id, "message": "Pipeline queued successfully"}
+
+
+
+
+
+# @app.post("/api/start")
+# async def start_pipeline(
+#     background_tasks: BackgroundTasks,
+#     file: UploadFile = File(...),
+#     current_user: dict = Depends(get_current_user)
+# ):
+#     # Extract text from uploaded PDF or DOCX
+#     screenplay_text = await extract_text_from_file(file)
+    
+#     thread_id = str(uuid.uuid4())
+#     config = {"configurable": {"thread_id": thread_id}}
+    
+#     projects_collection.insert_one({
+#         "thread_id": thread_id,
+#         "username": current_user["username"],
+#         "status": "started",
+#         "original_screenplay": screenplay_text
+#     })
+    
+#     initial_state = {"screenplay_text": screenplay_text, "current_step": "init"}
+#     background_tasks.add_task(run_pipeline_background, initial_state, config)
+    
+#     return {"thread_id": thread_id, "message": "Pipeline started in background"}
 
 
 
