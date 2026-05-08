@@ -1,46 +1,136 @@
+# import os
+# import json
+# import time
+# from azure.servicebus import ServiceBusClient
+# from app import app_graph, projects_collection 
+
+# SERVICE_BUS_CONN_STR = os.getenv("SERVICE_BUS_CONN_STR")
+# QUEUE_NAME = "pipeline-jobs"
+
+# def process_job(message_body: dict):
+#     thread_id = message_body["thread_id"]
+#     screenplay_text = message_body["screenplay_text"]
+    
+#     # Update status to processing in Cosmos DB
+#     projects_collection.update_one(
+#         {"thread_id": thread_id},
+#         {"$set": {"status": "processing"}}
+#     )
+    
+#     initial_state = {"screenplay_text": screenplay_text, "current_step": "init"}
+#     config = {"configurable": {"thread_id": thread_id}}
+    
+#     try:
+#         print(f"Starting 6-hour LangGraph pipeline for {thread_id}...")
+#         app_graph.invoke(initial_state, config)
+#         print(f"Pipeline completed for {thread_id}")
+#     except Exception as e:
+#         print(f"Pipeline failed for {thread_id}: {e}")
+#         projects_collection.update_one(
+#             {"thread_id": thread_id},
+#             {"$set": {"status": "failed", "error": str(e)}}
+#         )
+
+# def main():
+#     print("Worker started, waiting for jobs from Service Bus...")
+#     # The worker connects to the queue and waits for a message
+#     with ServiceBusClient.from_connection_string(SERVICE_BUS_CONN_STR) as client:
+#         with client.get_queue_receiver(queue_name=QUEUE_NAME, max_wait_time=5) as receiver:
+#             for msg in receiver:
+#                 body = json.loads(str(msg))
+#                 process_job(body)
+#                 # Important: Tell Service Bus the 6-hour job is done so it removes the message
+#                 receiver.complete_message(msg)
+
+# if __name__ == "__main__":
+#     main()
+
+
+
+
+
 import os
 import json
 import time
 from azure.servicebus import ServiceBusClient
+# Importing your existing graph and database collections from app.py
 from app import app_graph, projects_collection 
 
 SERVICE_BUS_CONN_STR = os.getenv("SERVICE_BUS_CONN_STR")
 QUEUE_NAME = "pipeline-jobs"
 
 def process_job(message_body: dict):
+    """
+    This function handles the actual 5-6 hour LangGraph execution.
+    It runs COMPLETELY OFFLINE from the Azure Service Bus connection.
+    """
     thread_id = message_body["thread_id"]
     screenplay_text = message_body["screenplay_text"]
     
-    # Update status to processing in Cosmos DB
-    projects_collection.update_one(
-        {"thread_id": thread_id},
-        {"$set": {"status": "processing"}}
-    )
+    # 1. Update status to processing in Cosmos DB
+    try:
+        projects_collection.update_one(
+            {"thread_id": thread_id},
+            {"$set": {"status": "processing"}}
+        )
+        print(f"[{thread_id}] Status updated to 'processing' in Cosmos DB.")
+    except Exception as db_err:
+        print(f"[{thread_id}] Failed to update DB to processing: {db_err}")
     
+    # 2. Setup LangGraph state and config
     initial_state = {"screenplay_text": screenplay_text, "current_step": "init"}
     config = {"configurable": {"thread_id": thread_id}}
     
+    # 3. Execute the heavy pipeline
     try:
-        print(f"Starting 6-hour LangGraph pipeline for {thread_id}...")
+        print(f"[{thread_id}] Starting 6-hour LangGraph pipeline...")
+        # Note: Your app_graph's persist_output_node automatically sets status to 'completed' at the end
         app_graph.invoke(initial_state, config)
-        print(f"Pipeline completed for {thread_id}")
+        print(f"[{thread_id}] Pipeline completed successfully.")
     except Exception as e:
-        print(f"Pipeline failed for {thread_id}: {e}")
-        projects_collection.update_one(
-            {"thread_id": thread_id},
-            {"$set": {"status": "failed", "error": str(e)}}
-        )
+        print(f"[{thread_id}] Pipeline failed: {e}")
+        # Mark as failed in DB so the user knows via the frontend UI
+        try:
+            projects_collection.update_one(
+                {"thread_id": thread_id},
+                {"$set": {"status": "failed", "error": str(e)}}
+            )
+        except Exception as db_err:
+            print(f"[{thread_id}] Failed to log error to DB: {db_err}")
 
 def main():
-    print("Worker started, waiting for jobs from Service Bus...")
-    # The worker connects to the queue and waits for a message
-    with ServiceBusClient.from_connection_string(SERVICE_BUS_CONN_STR) as client:
-        with client.get_queue_receiver(queue_name=QUEUE_NAME, max_wait_time=5) as receiver:
-            for msg in receiver:
-                body = json.loads(str(msg))
-                process_job(body)
-                # Important: Tell Service Bus the 6-hour job is done so it removes the message
-                receiver.complete_message(msg)
+    print("Worker container started. Connecting to Azure Service Bus...")
+    job_to_run = None
+    
+    # =====================================================================
+    # STEP 1: THE QUICK FETCH
+    # Connect, grab exactly ONE message, tell Azure to delete it, and disconnect.
+    # =====================================================================
+    try:
+        with ServiceBusClient.from_connection_string(SERVICE_BUS_CONN_STR) as client:
+            with client.get_queue_receiver(queue_name=QUEUE_NAME, max_wait_time=5) as receiver:
+                for msg in receiver:
+                    job_to_run = json.loads(str(msg))
+                    
+                    # IMPORTANT: Tell Service Bus we have the message BEFORE starting the heavy work
+                    receiver.complete_message(msg)
+                    print(f"Successfully pulled job {job_to_run['thread_id']} off the queue.")
+                    
+                    # Break the loop immediately so we only process one job and sever the connection
+                    break 
+    except Exception as sb_err:
+        print(f"Error communicating with Service Bus: {sb_err}")
+        return # Exit the script if we can't connect
+
+    # =====================================================================
+    # STEP 2: THE HEAVY LIFT
+    # Run the 6-hour process completely independent of the Service Bus connection.
+    # =====================================================================
+    if job_to_run:
+        print("Disconnected from Service Bus. Beginning offline processing phase.")
+        process_job(job_to_run)
+    else:
+        print("No messages found in the queue. Worker shutting down.")
 
 if __name__ == "__main__":
     main()
